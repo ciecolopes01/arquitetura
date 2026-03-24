@@ -1375,10 +1375,11 @@ Cada nível depende das fundações do anterior.
 
 | Problema | Sintoma | Impacto | Mitigação |
 |---|---|---|---|
-| Kafka lag alto | backlog crescente | atraso em dashboards | scale + backpressure |
-| Small files Iceberg | queries lentas | custo e latência ↑ | compaction |
-| Airflow saturado | DAGs atrasando | perda de SLA | segmentação |
-| Schema drift | pipeline quebra | indisponibilidade | contracts + quarantine |
+| Kafka lag alto | atraso crescente | dashboards defasados | scale + backpressure |
+| CDC inconsistente | divergência hot vs lake | dados incorretos | reconciliação |
+| Iceberg small files | queries lentas | custo ↑ | compaction |
+| Airflow saturado | DAGs atrasam | SLA quebrado | segmentação |
+| Schema drift | pipeline quebra | indisponibilidade | contracts |
 
 ---
 

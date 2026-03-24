@@ -1036,24 +1036,22 @@ source:
 
 > ❗ **Regra:** Kafka **não é fonte de verdade** para dados históricos. Retention é 7 dias. O Bronze/Iceberg é o registro oficial.
 
-### 9.6 Reconciliação: Hot Store vs Iceberg
+## 🔁 Reconciliação: Hot Store vs Iceberg
 
-**Processo diário obrigatório:**
+Processo:
 
-1. **Seleciona janela:** (ex: últimas 24h)
-2. **Compara:**
-   - DynamoDB (estado atual online)
+1. Seleciona janela (ex: últimas 24h)
+2. Compara:
+   - DynamoDB (estado atual)
    - Iceberg (estado consolidado)
-3. **Calcula divergência:** (% e quantidade de registros)
-4. **Se > threshold:**
-   - reprocessa via replay Kafka
-   - dispara alerta P2 no PagerDuty
+3. Calcula divergência (% e registros)
+4. Se divergência > threshold:
+   - replay Kafka
+   - alerta P2
 
-**Regra inegociável:**
-Hot store é apenas derivado operacional.
-Iceberg é a autoridade absoluta do sistema.
-
-**Código Base de Reconciliação:**
+Regra:
+Hot store é projeção.
+Iceberg é autoridade.
 
 ```python
 def reconcile_hot_store(table: str):
@@ -1556,17 +1554,27 @@ Não confie apenas no architecture diagram. **Plataformas quebram nestes pontos 
 
 ---
 
-## 🧪 14. Testes da Plataforma
+## 🧪 Testes da Plataforma
 
-A validação de código não confere se a arquitetura em escala é confiável. Tipos obrigatórios de testes na infraestrutura de dados:
+Tipos obrigatórios:
 
-* **Teste de Idempotência:** Reprocessar (*rerun*) uma partição/dag inteira e provar que o output não duplica e sim sobreescreve a fatia.
-* **Teste de Replay Kafka:** Alterar o offset inicial de um spark job para D-3 e confirmar que o Iceberg reabsorve a janela temporal sem corrupção.
-* **Teste de Schema Evolution:** Injetar evento no Debezium com campo removido e verificar se o Quality Gate segura o pipeline (quarantine).
-* **Teste de Job Interrupted:** Dar *kill* no cluster EMR no exato meio de um micro-batch e verificar se o commit falha atomicamente (sem sujeira).
-* **Teste de Contract Breaking:** Atualizar schema registry num endpoint de forma incompatível — o CI/CD deve travar o deploy.
+- Idempotência:
+  rerun não duplica dados
 
-Sem a aprovação contínua nestes testes, **a plataforma não deve receber status de produção nível crítico**.
+- Replay:
+  Kafka → Iceberg reproduz estado corretamente
+
+- Schema evolution:
+  mudança backward não quebra pipeline
+
+- Failure:
+  kill job no meio → recuperação consistente
+
+- Contract:
+  breaking change bloqueia pipeline
+
+Sem esses testes:
+a plataforma não é confiável em produção.
 
 ---
 
