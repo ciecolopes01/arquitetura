@@ -1553,17 +1553,15 @@ flowchart TD
 [o que mudar para evitar recorrência]
 ```
 
-### 13.5 Failure Modes Operacionais
+## ⚠️ Failure Modes Operacionais (Resumo)
 
-Não confie apenas no architecture diagram. **Plataformas quebram nestes pontos críticos**:
-
-| Componente | Problema | Sintoma | Ação Recomendada |
+| Componente | Problema | Sintoma | Mitigação |
 |---|---|---|---|
-| **Debezium** | Lag alto crônico | Atraso grave nos eventos CDC online | Aumentar `tasks.max` ou particionar tabelas maiores |
-| **Kafka** | Skew de partição | Batch Spark com tempo imprevisível | Tratar *hot keys*, forçar repartition no streaming |
-| **Spark** | OOM (Out Of Memory) | Job falha iterativamente | Ajustar partitions e `memoryOverhead` do executor |
-| **Iceberg** | Small files explosion | Tempo de commit longo e timeouts | Forçar rotina agressiva de `compaction` |
-| **Airflow** | Scheduler estrangulado | DAGs demoram a sair de _scheduled_ | Segmentar ambiente (`dag_factory` max limites) |
+| Debezium | lag alto | atraso CDC | scale connector |
+| Kafka | skew partição | batch lento | repartition |
+| Spark | OOM | job falha | tuning + partitions |
+| Iceberg | small files | queries lentas | compaction |
+| Airflow | scheduler saturado | DAG atraso | segmentação |
 
 ---
 
