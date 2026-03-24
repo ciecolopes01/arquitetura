@@ -4,7 +4,20 @@
 > **Escopo:** Orquestração dinâmica, CDC log-based, JDBC polling, real-time, reexecução  
 > **Stack:** AWS MWAA · EMR Serverless · MSK Kafka · Debezium · MSK Connect · Iceberg · Glue
 
-> 📘 **Documento complementar:** Para conceitos, princípios, anti-patterns, compliance e trade-offs, consulte o [README.md](./README.md).
+---
+
+## 🎯 Escopo deste documento
+
+Este documento detalha a implementação técnica da arquitetura descrita no README.md.
+
+Aqui estão cobertos:
+- CDC e ingestão
+- Processamento batch e streaming
+- Orquestração
+- Observabilidade
+- Operação (SRE)
+
+Os princípios arquiteturais (fonte da verdade, consistência, governança, trade-offs) estão definidos no README e são aplicados aqui de forma prática.
 
 ---
 

@@ -17,7 +17,9 @@ Este artigo detalha o que realmente caracteriza uma arquitetura moderna quando v
 * compliance (LGPD/GDPR)
 * crescimento contínuo
 
-> 📘 **Documento complementar:** Para detalhes de implementação, código, configurações e diagramas técnicos, consulte o [IMPLEMENTACAO.md](./IMPLEMENTACAO.md).
+Este documento foca na arquitetura conceitual e decisões estruturais.
+
+📘 Para implementação detalhada (código, configurações e fluxos operacionais), consulte o [IMPLEMENTACAO.md](./IMPLEMENTACAO.md).
 
 ---
 
