@@ -1036,29 +1036,24 @@ source:
 
 > ❗ **Regra:** Kafka **não é fonte de verdade** para dados históricos. Retention é 7 dias. O Bronze/Iceberg é o registro oficial.
 
-### 9.6 Reconciliação: Hot Store vs Curated
+### 9.6 Reconciliação: Hot Store vs Iceberg
 
-DynamoDB (hot store) é **derivado operacional** e pode divergir temporariamente do Iceberg Curated. A reconciliação oficial é **sempre contra Iceberg Curated**.
+**Processo diário obrigatório:**
 
-```mermaid
-flowchart LR
-    CDC["Evento CDC"] --> LAMBDA["Lambda\natualiza DynamoDB\n< 1s"]
-    CDC --> SPARK["Spark SS\nMERGE INTO Iceberg\n1-5min"]
-    LAMBDA --> DDB["DynamoDB\nhot store · eventual"]
-    SPARK --> ICE["Iceberg Curated\nfonte oficial"]
-    ICE -->|reconciliação diária| DDB
-```
+1. **Seleciona janela:** (ex: últimas 24h)
+2. **Compara:**
+   - DynamoDB (estado atual online)
+   - Iceberg (estado consolidado)
+3. **Calcula divergência:** (% e quantidade de registros)
+4. **Se > threshold:**
+   - reprocessa via replay Kafka
+   - dispara alerta P2 no PagerDuty
 
-**Comportamento esperado:**
+**Regra inegociável:**
+Hot store é apenas derivado operacional.
+Iceberg é a autoridade absoluta do sistema.
 
-| Situação | DynamoDB | Iceberg | Ação |
-|---|---|---|---|
-| Operação normal | Atualizado < 1s | Atualizado < 5min | Nenhuma |
-| Lambda falha | **Desatualizado** | Atualizado | Reconciliação automática via batch |
-| Spark falha | Atualizado | **Desatualizado** | DLQ + retry; DynamoDB serve como cache |
-| Divergência detectada | Valor X | Valor Y | **Iceberg prevalece** — DynamoDB é sobrescrito |
-
-**Reconciliação automática (diária):**
+**Código Base de Reconciliação:**
 
 ```python
 def reconcile_hot_store(table: str):
@@ -1076,6 +1071,27 @@ def reconcile_hot_store(table: str):
         write_to_dynamodb(divergences.select(iceberg_columns))
         alert(f"Reconciliação: {divergences.count()} registros corrigidos em {table}")
 ```
+
+```
+
+---
+
+## 📦 Estratégia de Compaction (Iceberg)
+
+**Problema:**
+A ingestão via micro-batch e *late events* geram thousands de pequenos arquivos. *Small files* degradam severamente o tempo de leitura no Athena e o overhead de commit.
+
+**Estratégia Operacional:**
+
+* **Trigger (Gatilho):**
+  * > 1000 arquivos pequenos acumulados por partição *ou*
+  * Tamanho médio dos arquivos < 128MB
+* **Ação Automática:**
+  * Processo de `rewrite data files` (bin-packing)
+  * Agendamento: compactação diária (off-peak hours) ou acionamento sob demanda
+* **Trade-off:**
+  * ✔ Melhora drástica na velocidade de query e estabilidade do storage
+  * ✖ Custo transacional computacional na reescrita periódica
 
 ---
 
@@ -1526,9 +1542,35 @@ flowchart TD
 [o que mudar para evitar recorrência]
 ```
 
+### 13.5 Failure Modes Operacionais
+
+Não confie apenas no architecture diagram. **Plataformas quebram nestes pontos críticos**:
+
+| Componente | Problema | Sintoma | Ação Recomendada |
+|---|---|---|---|
+| **Debezium** | Lag alto crônico | Atraso grave nos eventos CDC online | Aumentar `tasks.max` ou particionar tabelas maiores |
+| **Kafka** | Skew de partição | Batch Spark com tempo imprevisível | Tratar *hot keys*, forçar repartition no streaming |
+| **Spark** | OOM (Out Of Memory) | Job falha iterativamente | Ajustar partitions e `memoryOverhead` do executor |
+| **Iceberg** | Small files explosion | Tempo de commit longo e timeouts | Forçar rotina agressiva de `compaction` |
+| **Airflow** | Scheduler estrangulado | DAGs demoram a sair de _scheduled_ | Segmentar ambiente (`dag_factory` max limites) |
+
 ---
 
-## 14. Decisões Arquiteturais
+## 🧪 14. Testes da Plataforma
+
+A validação de código não confere se a arquitetura em escala é confiável. Tipos obrigatórios de testes na infraestrutura de dados:
+
+* **Teste de Idempotência:** Reprocessar (*rerun*) uma partição/dag inteira e provar que o output não duplica e sim sobreescreve a fatia.
+* **Teste de Replay Kafka:** Alterar o offset inicial de um spark job para D-3 e confirmar que o Iceberg reabsorve a janela temporal sem corrupção.
+* **Teste de Schema Evolution:** Injetar evento no Debezium com campo removido e verificar se o Quality Gate segura o pipeline (quarantine).
+* **Teste de Job Interrupted:** Dar *kill* no cluster EMR no exato meio de um micro-batch e verificar se o commit falha atomicamente (sem sujeira).
+* **Teste de Contract Breaking:** Atualizar schema registry num endpoint de forma incompatível — o CI/CD deve travar o deploy.
+
+Sem a aprovação contínua nestes testes, **a plataforma não deve receber status de produção nível crítico**.
+
+---
+
+## 15. Decisões Arquiteturais
 
 ### JDBC vs CDC — por pipeline, não por arquitetura
 
@@ -1585,7 +1627,7 @@ Esta padronização evita o problema de manter dois paradigmas de streaming dife
 
 ---
 
-## 15. Experiência do Desenvolvedor
+## 16. Experiência do Desenvolvedor
 
 ### Novo pipeline CDC — do zero ao produção
 
@@ -1631,7 +1673,7 @@ sequenceDiagram
 
 ---
 
-## 16. Próximos Passos
+## 17. Próximos Passos
 
 | Item | Responsável | Sprint | Prioridade |
 |---|---|---|---|

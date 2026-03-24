@@ -669,6 +669,20 @@ Governança exige **disciplina operacional**, não apenas discurso bonito.
 
 > 📘 **Detalhes de implementação:** Veja [IMPLEMENTACAO.md — Data Contracts e Qualidade](./IMPLEMENTACAO.md#11-data-contracts-e-qualidade) para Schema Registry integrado ao CDC, Quality Catalog e enforcement de schema evolution no runtime.
 
+### Fonte da Verdade
+
+> ❗ **Statement arquitetural:** DynamoDB (ou qualquer hot store) é uma **projeção operacional eventual-consistente**. O estado oficial e reconciliável do sistema é **sempre o Iceberg na camada Bronze/Silver**. Divergências temporárias são esperadas e tratadas por reconciliação automática diária.
+
+### Enforcement de Contracts no Runtime
+
+Breaking changes são tratadas **automaticamente** pelo pipeline:
+
+| Tipo | Ação automática |
+|---|---|
+| **Non-breaking** (campo opcional adicionado) | ✅ Pipeline segue normalmente |
+| **Breaking controlado** (tipo alterado, campo obrigatório novo) | ⚠️ Quarentena + alerta P2 |
+| **Breaking crítico** (campo removido, tabela renomeada) | 🛑 Pipeline bloqueado (fail-fast) + alerta P1 + page oncall |
+
 ---
 
 # 5️⃣ Observabilidade End-to-End
@@ -738,6 +752,16 @@ sum(eventos_processados_total{pipeline="pedidos"})
 Sem consequência real (oncall, postmortem), SLO é apenas decoração no dashboard.
 
 > 📘 **Detalhes de implementação:** Veja [IMPLEMENTACAO.md — Observabilidade](./IMPLEMENTACAO.md#12-observabilidade) para alertas automáticos via YAML, dashboard de correlação end-to-end e diagnóstico automático de bottleneck.
+
+### Fio condutor técnico: Correlation ID
+
+Observabilidade end-to-end exige rastreabilidade entre sistemas:
+
+```
+event_id (Kafka offset) → batch_id (Spark micro-batch) → snapshot_id (Iceberg commit) → alert_id (CloudWatch/PagerDuty)
+```
+
+Um único `correlation_id` propaga contexto do evento Kafka até o alerta, permitindo reconstruir o caminho completo de qualquer batch em segundos.
 
 ---
 
@@ -1347,6 +1371,117 @@ Cada nível depende das fundações do anterior.
 
 ---
 
+## ⚠️ Quando essa arquitetura falha (Failure Modes)
+
+| Problema | Sintoma | Impacto | Mitigação |
+|---|---|---|---|
+| Kafka lag alto | backlog crescente | atraso em dashboards | scale + backpressure |
+| Small files Iceberg | queries lentas | custo e latência ↑ | compaction |
+| Airflow saturado | DAGs atrasando | perda de SLA | segmentação |
+| Schema drift | pipeline quebra | indisponibilidade | contracts + quarantine |
+
+---
+
+## 🧱 Arquitetura mínima viável
+
+Comece simples:
+
+1. Batch (Airflow + Spark)
+2. Iceberg como storage único
+3. Data quality básica
+
+Evolua para:
+
+4. CDC nos fluxos críticos
+5. Streaming onde há necessidade real
+6. Feature Store para ML
+
+Arquitetura moderna não é ponto de partida.  
+É caminho de evolução.
+
+---
+
+# 🧠 FAQ Técnico — Perguntas que vão aparecer (cedo ou tarde)
+
+> As perguntas abaixo não são teóricas. São as mesmas que aparecem quando essa arquitetura encontra produção.
+>
+> Se você não está fazendo essas perguntas, sua arquitetura ainda não foi testada de verdade.
+
+### ❓ Isso não é over-engineering?
+
+Depende do contexto. Essa arquitetura resolve problemas de escala (10M+ usuários), múltiplos domínios, ML em produção e compliance. Se você tem 10 tabelas, batch diário e 1 dashboard — isso é overkill.
+
+Mas quando você precisa de replay, consistência online/offline e baixa latência + histórico, simplificar demais vira dívida técnica.
+
+**Regra prática:** comece simples, mas **com caminho de evolução claro**. A arquitetura é modular — cada componente pode ser adotado incrementalmente conforme a maturidade.
+
+### ❓ Por que não usar só batch?
+
+Porque batch e streaming resolvem problemas diferentes.
+
+* **Batch:** ✔ barato, ✔ simples, ✖ latência alta
+* **Streaming:** ✔ baixa latência, ✔ reatividade, ✖ mais complexo
+
+> 💡 **Trade-off Inevitável:** Baixa latência sempre tem custo operacional. Se o negócio não precisa de respostas em < 5 minutos, adotar streaming é pagar por vaidade técnica.
+
+A arquitetura suporta ambos porque o negócio exige: decisões em tempo real **e** histórico consistente. O mesmo `SourceAdapter` gera argumentos Spark para ambos os modos — sem duplicar lógica.
+
+### ❓ Exactly-once realmente existe?
+
+Não como promessa mágica. O que existe na prática é:
+
+* Idempotência no sink (Iceberg MERGE + deduplicação por PK + `ts_ms`)
+* Controle de estado (Spark checkpoint)
+* Overwrite atômico de partições (marker `_SUCCESS`)
+
+Se você depender do framework para "garantir exactly-once", você vai ter duplicata. Exactly-once é **propriedade emergente da arquitetura**, não feature.
+
+### ❓ Qual é a fonte da verdade?
+
+Essa é a pergunta mais importante.
+
+* **Kafka** → transporte de eventos (não é histórico — retention 7 dias)
+* **DynamoDB / Redis** → projeções operacionais (podem divergir temporariamente)
+* **Iceberg (Bronze/Silver)** → fonte oficial e reconciliável
+
+O estado final do sistema é **sempre derivável do lake**. Hot stores são derivadas, não autoridade.
+
+### ❓ E se os dados ficarem inconsistentes entre online e batch?
+
+Vai acontecer. A arquitetura assume isso.
+
+Por isso existem: replay de eventos, reconciliação periódica automática (diária) e definição única de lógica. Consistência aqui é **eventual + verificável**, não instantânea. O Iceberg sempre prevalece em caso de divergência.
+
+### ❓ E se o Kafka cair?
+
+Kafka não é ponto único de falha se bem configurado. Mas falhas acontecem.
+
+Estratégia em 3 camadas: (1) **Replay** via retention de 7 dias, (2) **DLQ + retry** automático via DAG de reexecução, (3) **Fallback JDBC** para tabelas críticas em standby. Sistema resiliente não depende de caminho único.
+
+### ❓ Como evitar CDC virar caos?
+
+CDC é fácil de ligar e difícil de controlar. Sem governança, vira custo alto + dados inúteis + Kafka saturado.
+
+Por isso: whitelist obrigatória, scoring custo vs valor, revisão semestral. CDC não é default — é decisão governada.
+
+### ❓ Qual o limite dessa arquitetura?
+
+Não é técnico — é operacional. Os gargalos reais são: capacidade do time operar (oncall), governança entre domínios e custo sob controle. Não é Kafka, nem Spark — é disciplina de engenharia.
+
+### ❓ Quanto custa operar isso?
+
+Mais do que arquitetura simples. Você paga com infra (Kafka, streaming, cache), observabilidade e tempo de engenharia. Mas o retorno vem quando você precisa escalar, reduzir latência, suportar ML ou atender compliance. Sem ROI claro, isso vira hobby caro. Os números neste documento são [cenários exemplificativos de referência](#exemplo-de-roi-feature-store).
+
+### ❓ Quando essa arquitetura NÃO faz sentido?
+
+Quando: volume baixo, poucos consumidores, sem ML e latência não é crítica. Nesses casos, um bom batch resolve 90% do problema com 10% do custo.
+
+---
+
+> Se alguém ler tudo isso e ainda achar que arquitetura moderna é _"colocar Kafka no diagrama"_, então não é problema da arquitetura — é problema de entendimento.
+
+---
+
 # 🔟 Checklist de Modernidade Real
 
 Use este checklist para avaliar sua arquitetura atual:
@@ -1397,44 +1532,9 @@ Se sua arquitetura só funciona no PowerPoint, ela não é moderna.
 
 ---
 
----
+**Arquitetura moderna não é sobre escalar.**
 
-# FAQ — Perguntas Frequentes (Defesa Técnica)
-
-Respostas preparadas para questionamentos comuns em revisão arquitetural.
-
-### "Por que tanta complexidade? Não é over-engineering?"
-
-A arquitetura é **modular e orientada a capacidade**. Cada componente resolve um problema específico: CDC (captura de mudanças), Kafka (replay e desacoplamento), EMR (processamento pesado), DynamoDB (baixa latência). Em cenários menores, é possível — e recomendado — usar apenas um subconjunto. Um time com 3 pipelines batch não precisa de Kafka. A arquitetura suporta adoção incremental por nível de maturidade (veja [Evolução por Maturidade](#9️⃣-evolução-por-maturidade)).
-
-### "Por que misturar streaming e batch?"
-
-Porque os requisitos são diferentes e coexistem. Batch é custo-eficiente para consolidação histórica e SCD Type 2. Streaming é necessário quando latência < 5min é requisito de negócio. A arquitetura suporta ambos **sem duplicar lógica**: o mesmo `SourceAdapter` gera argumentos Spark tanto para batch (EMR) quanto para streaming (Spark SS), e o `PipelineOrchestratorEngine` é agnóstico ao modo.
-
-### "Exactly-once é real nessa arquitetura?"
-
-Exactly-once **não é garantia mágica do framework**. É garantido pela **combinação** de três mecanismos: (1) idempotência no sink via `MERGE INTO` Iceberg com deduplicação por PK + `ts_ms`, (2) checkpoint consistente do Spark Structured Streaming, e (3) overwrite atômico de partições com marker `_SUCCESS`. Nenhum componente isolado garante exactly-once; é a composição que garante.
-
-### "E se o Kafka cair?"
-
-Três camadas de fallback: (1) **Replay**: o Kafka tem retenção de 7 dias — após recovery, o consumer retoma do último offset commitado. (2) **DLQ + retry**: falhas de processamento vão para SQS DLQ com retry automático via DAG de reexecução. (3) **Fallback JDBC**: para tabelas críticas, é possível manter um pipeline JDBC em standby que ativa automaticamente se o CDC ficar indisponível por > 30min, usando a mesma interface `SourceAdapter`.
-
-### "Qual o limite de escala do Airflow?"
-
-Os limites estão documentados na seção [Limites de Escala](./IMPLEMENTACAO.md#44-limites-de-escala-e-segmentação): máximo recomendado de 100 DAGs por `dag_factory.py`, com segmentação por domínio acima disso. Para cenários de 500+ pipelines, a evolução natural é migrar a orquestração para Apache Airflow 2.x com múltiplos schedulers ou avaliar alternativas como Dagster/Prefect como orquestrador, mantendo os Adapters e Engines intactos.
-
-### "Quanto custa operar isso?"
-
-O custo operacional cresce com maturidade, não linearmente com volume. A arquitetura **só faz sentido quando há ROI claro**: ML em produção, múltiplos domínios, compliance, ou escala que justifique a plataforma. Para um time com 5 pipelines batch, um Airflow + EMR simples é suficiente. Os números de custo neste documento são [cenários exemplificativos](#exemplo-de-roi-feature-store), não benchmarks universais.
-
----
-
-**Arquitetura moderna não é sobre usar as ferramentas mais novas.**
-
-É sobre construir sistemas que **resistem ao crescimento, à auditoria, ao erro humano e ao tempo**.
-
-**Ferramentas mudam.**  
-**Capacidades permanecem.**
+**É sobre não perder consistência quando escala.**
 
 ---
 
