@@ -17,6 +17,34 @@ Este artigo detalha o que realmente caracteriza uma arquitetura moderna quando v
 * compliance (LGPD/GDPR)
 * crescimento contínuo
 
+> 📘 **Documento complementar:** Para detalhes de implementação, código, configurações e diagramas técnicos, consulte o [IMPLEMENTACAO.md](./IMPLEMENTACAO.md).
+
+---
+
+## Sumário
+
+1. [O que define modernidade de verdade](#1️⃣-o-que-define-modernidade-de-verdade)
+2. [Anti-Patterns da Modernidade Cosmética](#2️⃣-anti-patterns-da-modernidade-cosmética)
+   - [Anti-Patterns Avançados de Escala](#2️⃣1-anti-patterns-avançados-de-escala)
+3. [Arquitetura Estrutural Moderna](#3️⃣-arquitetura-estrutural-moderna)
+   - [Ingestão Event-Driven](#-31-ingestão-event-driven)
+   - [Lakehouse com ACID real](#-32-lakehouse-com-acid-real)
+   - [Streaming Stateful de Verdade](#-33-streaming-stateful-de-verdade)
+   - [Feature Store Consistente](#-34-feature-store-consistente)
+   - [Orquestração Moderna](#-35-orquestração-moderna)
+   - [Catálogo de Dados Vivo](#-36-catálogo-de-dados-vivo)
+4. [Governança Operacional — Data Mesh Real](#4️⃣-governança-operacional-data-mesh-real)
+5. [Observabilidade End-to-End](#5️⃣-observabilidade-end-to-end)
+6. [Custos, ROI e Trade-offs](#6️⃣-custos-roi-e-trade-offs)
+   - [Casos de Uso Reais por Indústria](#6️⃣1-casos-de-uso-reais-por-indústria)
+   - [Comparativo de Custos](#6️⃣2-comparativo-de-custos-tradicional-vs-moderno)
+7. [Compliance (LGPD/GDPR)](#7️⃣-compliance-lgpdgdpr)
+8. [Disaster Recovery](#8️⃣-disaster-recovery)
+9. [Evolução por Maturidade](#9️⃣-evolução-por-maturidade)
+   - [Guia de Migração Progressiva](#9️⃣1-guia-de-migração-progressiva)
+10. [Checklist de Modernidade Real](#🔟-checklist-de-modernidade-real)
+11. [Glossário Técnico](#-glossário-técnico)
+
 ---
 
 # 1️⃣ O que define modernidade de verdade
@@ -227,6 +255,8 @@ Nem todo sistema precisa de event sourcing. A maioria precisa apenas de streamin
 
 Campo opcional com default não quebra consumers antigos.
 
+> 📘 **Detalhes de implementação:** Veja [IMPLEMENTACAO.md — Debezium + MSK Kafka](./IMPLEMENTACAO.md#3-debezium--msk-kafka--cdc-log-based) para pré-requisitos por banco, configuração de conectores e formato de eventos CDC.
+
 ---
 
 ## 🔹 3.2 Lakehouse com ACID real
@@ -294,6 +324,8 @@ Ele envolve processamento complexo:
 | **Kafka Streams**          | Transformações leves, baixa latência | State distribuído pesado   |
 
 Escolha é engenharia de requisitos, não moda de conferência.
+
+> 📘 **Detalhes de implementação:** Veja [IMPLEMENTACAO.md — Real-Time](./IMPLEMENTACAO.md#8-processamento-em-real-time) para diagrama de fluxo Lambda vs Glue Streaming vs EMR batch.
 
 ---
 
@@ -453,6 +485,8 @@ SELECT * FROM pedidos_raw
 ```
 
 Sem idempotência, cada retry gera inconsistência.
+
+> 📘 **Detalhes de implementação:** Veja [IMPLEMENTACAO.md — DAG Factory](./IMPLEMENTACAO.md#4-dag-factory--geração-dinâmica) para cache sentinela, config inheritance e componentes SOLID.
 
 ---
 
@@ -616,6 +650,8 @@ Consumer com validação estrita (`if status NOT IN ['pendente', 'pago', 'cancel
 
 Governança exige **disciplina operacional**, não apenas discurso bonito.
 
+> 📘 **Detalhes de implementação:** Veja [IMPLEMENTACAO.md — Data Contracts e Qualidade](./IMPLEMENTACAO.md#9-data-contracts-e-qualidade) para Schema Registry integrado ao CDC e Quality Catalog consultável.
+
 ---
 
 # 5️⃣ Observabilidade End-to-End
@@ -683,6 +719,8 @@ sum(eventos_processados_total{pipeline="pedidos"})
 **Princípio fundamental:**
 
 Sem consequência real (oncall, postmortem), SLO é apenas decoração no dashboard.
+
+> 📘 **Detalhes de implementação:** Veja [IMPLEMENTACAO.md — Observabilidade](./IMPLEMENTACAO.md#10-observabilidade) para alertas automáticos via YAML e stack completo de monitoramento.
 
 ---
 
@@ -1303,4 +1341,4 @@ Cristiano Lopes
 **Feedback e discussões:**  
 https://www.linkedin.com/in/cristianolopesia/ | cristianolopes.ti@gmail.com
 
-**Última atualização:** Fevereiro 2026
+**Última atualização:** Março 2026
