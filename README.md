@@ -650,7 +650,22 @@ Consumer com validação estrita (`if status NOT IN ['pendente', 'pago', 'cancel
 
 Governança exige **disciplina operacional**, não apenas discurso bonito.
 
-> 📘 **Detalhes de implementação:** Veja [IMPLEMENTACAO.md — Data Contracts e Qualidade](./IMPLEMENTACAO.md#9-data-contracts-e-qualidade) para Schema Registry integrado ao CDC e Quality Catalog consultável.
+### Governança de Ingestão CDC
+
+> ⚠️ **Anti-pattern real:** A facilidade de plugar tabelas via YAML transforma CDC em captura indiscriminada. Cada tabela CDC tem custo contínuo (MSK Connect + Kafka storage).
+
+**Regras obrigatórias:**
+
+1. **Whitelist governada** — toda tabela CDC precisa de aprovação do Data Platform Team
+2. **Scoring custo vs valor** — avaliar frequência de mudanças, necessidade de latência, captura de DELETEs
+3. **Revisão semestral** — tabelas com baixo uso são migradas para JDBC
+4. **Custo transparente** — cada solicitante deve estimar o custo mensal
+
+**Regra de ouro:** Score > 3.5 → CDC recomendado. Score < 2.5 → JDBC suficiente.
+
+> 📘 **Detalhes de implementação:** Veja [IMPLEMENTACAO.md — Governança de Ingestão](./IMPLEMENTACAO.md#10-governança-de-ingestão) para whitelist YAML, scoring detalhado e processo de aprovação.
+
+> 📘 **Detalhes de implementação:** Veja [IMPLEMENTACAO.md — Data Contracts e Qualidade](./IMPLEMENTACAO.md#11-data-contracts-e-qualidade) para Schema Registry integrado ao CDC, Quality Catalog e enforcement de schema evolution no runtime.
 
 ---
 
@@ -720,7 +735,55 @@ sum(eventos_processados_total{pipeline="pedidos"})
 
 Sem consequência real (oncall, postmortem), SLO é apenas decoração no dashboard.
 
-> 📘 **Detalhes de implementação:** Veja [IMPLEMENTACAO.md — Observabilidade](./IMPLEMENTACAO.md#10-observabilidade) para alertas automáticos via YAML e stack completo de monitoramento.
+> 📘 **Detalhes de implementação:** Veja [IMPLEMENTACAO.md — Observabilidade](./IMPLEMENTACAO.md#12-observabilidade) para alertas automáticos via YAML, dashboard de correlação end-to-end e diagnóstico automático de bottleneck.
+
+---
+
+# 5️⃣.5 Modelo Operacional — SRE
+
+Arquitetura moderna sem modelo operacional claro é **caço sem coleira**.
+
+> ⚠️ Plataformas com alta entropia operacional (Kafka, Debezium, EMR, Airflow, DynamoDB) exigem resposta à pergunta: **quem opera isso 24/7?**
+
+## Pilares obrigatórios
+
+### 1. Estrutura de Oncall
+
+* **L1 — Automação:** Alertas automáticos, restart de conectores (24/7 via Lambda)
+* **L2 — Data Engineer oncall:** Pipeline failures, consumer lag, quality gates
+* **L3 — Tech Lead:** Falhas sistêmicas, data loss, schema breaking changes
+
+### 2. Runbooks versionados no Git
+
+Cada componente crítico (Debezium, Kafka, EMR, Airflow, DLQ) deve ter runbook com:
+* Sintoma → Diagnóstico → Resolução → Escalação
+* Tempo máximo de resolução por severidade
+
+### 3. Incident Response com SLA
+
+| Severidade | Critério | SLA Resposta | SLA Resolução |
+|---|---|---|---|
+| **P1 — Critical** | Data loss, pipeline crítico parado | < 5 min | < 1 hora |
+| **P2 — Warning** | Degradação, lag alto, quality fail | < 30 min | < 4 horas |
+| **P3 — Info** | Métrica fora do normal, não urgente | < 4 horas | Próximo sprint |
+
+### 4. Postmortem obrigatório
+
+Todo incidente P1 gera postmortem com:
+* Timeline detalhado
+* Causa raiz
+* Action items com responsável e prazo
+* Lições aprendidas
+
+### 5. Capacity Planning
+
+* Revisão mensal de métricas de infra (utilização, custo, tendências)
+* Projeção trimestral de crescimento
+* Budget aprovado por trimestre
+
+**Sem modelo operacional, sua arquitetura bonita vira pesadelo operacional em 3 meses.**
+
+> 📘 **Detalhes de implementação:** Veja [IMPLEMENTACAO.md — Modelo Operacional](./IMPLEMENTACAO.md#13-modelo-operacional--sre-e-incident-response) para estrutura de oncall, runbooks com exemplos e template de postmortem.
 
 ---
 
@@ -890,6 +953,10 @@ Modernidade sem ROI mensurável é **hobby técnico caro**.
 
 Compliance não é checkbox em formulário.  
 É implementação técnica desde a fundação.
+
+> ⚠️ **Gap comum:** Compliance descrito no README mas não conectado a enforcement real nos pipelines. As regras abaixo devem ser aplicadas **automaticamente** pelo `QualityGateEngine`, não manualmente.
+
+> 📘 **Enforcement automático:** Veja [IMPLEMENTACAO.md — Data Contracts e Qualidade](./IMPLEMENTACAO.md#11-data-contracts-e-qualidade) para `SchemaEvolutionEnforcer` que bloqueia pipelines automaticamente em caso de breaking change.
 
 ## 7.1 Right to be Forgotten
 

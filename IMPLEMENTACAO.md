@@ -19,20 +19,25 @@
    - [Configuração do conector](#32-configuração-do-conector)
    - [Formato do evento CDC](#33-formato-do-evento-cdc)
    - [DebeziumCdcAdapter](#34-debeziumcdcadapter)
+   - [Backpressure e Controle de Throughput](#35-backpressure-e-controle-de-throughput)
 4. [DAG Factory — geração dinâmica](#4-dag-factory--geração-dinâmica)
    - [O que o MWAA faz a cada 30s](#41-o-que-o-mwaa-faz-a-cada-30s)
    - [Cache com sentinela — só re-carrega quando muda](#42-cache-com-sentinela--só-re-carrega-quando-muda)
    - [Config inheritance](#43-config-inheritance)
+   - [Limites de Escala e Segmentação](#44-limites-de-escala-e-segmentação)
 5. [Componentes SOLID — Engine e Adapters](#5-componentes-solid--engine-e-adapters)
 6. [Fluxo de Execução Completo](#6-fluxo-de-execução-completo)
 7. [Reexecução — Retry, DLQ e Backfill](#7-reexecução--retry-dlq-e-backfill)
 8. [Processamento em Real-Time](#8-processamento-em-real-time)
-9. [Data Contracts e Qualidade](#9-data-contracts-e-qualidade)
-10. [Observabilidade](#10-observabilidade)
-11. [Decisões Arquiteturais](#11-decisões-arquiteturais)
-12. [Experiência do Desenvolvedor](#12-experiência-do-desenvolvedor)
-13. [Próximos Passos](#13-próximos-passos)
-14. [Referências e Serviços](#referências-e-serviços)
+9. [Consistência de Dados no CDC](#9-consistência-de-dados-no-cdc)
+10. [Governança de Ingestão](#10-governança-de-ingestão)
+11. [Data Contracts e Qualidade](#11-data-contracts-e-qualidade)
+12. [Observabilidade](#12-observabilidade)
+13. [Modelo Operacional — SRE e Incident Response](#13-modelo-operacional--sre-e-incident-response)
+14. [Decisões Arquiteturais](#14-decisões-arquiteturais)
+15. [Experiência do Desenvolvedor](#15-experiência-do-desenvolvedor)
+16. [Próximos Passos](#16-próximos-passos)
+17. [Referências e Serviços](#referências-e-serviços)
 
 ---
 
@@ -267,7 +272,7 @@ O conector é definido como um arquivo JSON e deployado no MSK Connect via CLI o
   "name": "oracle-sales-orders-connector",
   "config": {
     "connector.class": "io.debezium.connector.oracle.OracleConnector",
-    "tasks.max": "1",
+    "tasks.max": "1",                    // ver nota sobre scaling abaixo
 
     "database.hostname":         "${ORACLE_HOST}",
     "database.port":             "1521",
@@ -318,6 +323,16 @@ def deploy_connector(connector_config: dict):
     )
     return response
 ```
+
+> ⚠️ **Scaling de `tasks.max`:** Para tabelas de alto volume (>100k eventos/hora), considere `tasks.max: 2-4`. Cada task consome partições diferentes do tópico Kafka. Monitore a métrica `debezium.connector.lag` — se lag > 5 min consistentemente, aumente `tasks.max` e o número de partições do tópico proporcionalmente.
+>
+> **Guideline:**
+> | Volume (eventos/hora) | `tasks.max` | Partições Kafka |
+> |---|---|---|
+> | < 100k | 1 | 3 |
+> | 100k–500k | 2 | 6 |
+> | 500k–2M | 4 | 12 |
+> | > 2M | 4+ (avaliar split de conector) | 24+ |
 
 ---
 
@@ -422,25 +437,103 @@ class DebeziumCdcAdapter(SourceAdapter):
     def build_merge_query(self, staging_table: str, target_table: str) -> str:
         """
         Gera o MERGE INTO Iceberg considerando os três ops CDC.
-        Chamado pelo EMRJob após ler os eventos do Kafka.
+        CRÍTICO: Usa deduplicação por chave + ordering por ts_ms
+        para evitar inconsistência por late events e out-of-order.
         """
         keys_condition = " AND ".join(
             f"target.{k} = source.{k}" for k in self.get_merge_keys()
         )
+        pk_list = ", ".join(self.get_merge_keys())
         return f"""
             MERGE INTO {target_table} AS target
             USING (
-                SELECT * FROM {staging_table}
-                WHERE op IN ('c', 'u', 'd', 'r')
+                -- DEDUPLICAÇÃO: para cada PK, mantém apenas o evento
+                -- com maior ts_ms (mais recente), evitando que late
+                -- events sobrescrevam dados mais novos
+                SELECT * FROM (
+                    SELECT *,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY {pk_list}
+                            ORDER BY ts_ms DESC
+                        ) AS _rn
+                    FROM {staging_table}
+                    WHERE op IN ('c', 'u', 'd', 'r')
+                ) WHERE _rn = 1
             ) AS source
             ON {keys_condition}
+            -- Só aplica UPDATE/DELETE se source.ts_ms > target._cdc_ts_ms
+            -- (proteção contra out-of-order)
             WHEN MATCHED AND source.op = 'd'
+                AND source.ts_ms > target._cdc_ts_ms
                 THEN DELETE
             WHEN MATCHED AND source.op IN ('u', 'r')
+                AND source.ts_ms > target._cdc_ts_ms
                 THEN UPDATE SET *
             WHEN NOT MATCHED AND source.op IN ('c', 'r')
                 THEN INSERT *
         """
+```
+
+---
+
+### 3.5 Backpressure e Controle de Throughput
+
+Sem controle de backpressure, um pico de eventos CDC pode sobrecarregar Spark e causar OOM ou timeout.
+
+#### Configuração no YAML do pipeline
+
+```yaml
+# Backpressure configurável por pipeline
+dag_id: oracle_sales_cdc
+source:
+  type: oracle_cdc
+  connector_name: oracle-sales-conn
+  schema: SALES
+  table: ORDERS
+  primary_keys: [ORDER_ID]
+  # Controle de throughput
+  max_offsets_per_trigger: 50000      # máximo de eventos por micro-batch
+  adaptive_ingestion: true             # ajusta automaticamente baseado em lag
+  adaptive_thresholds:
+    low_lag: 1000                      # abaixo disso, reduz workers
+    high_lag: 50000                    # acima disso, aumenta workers
+    max_workers: 8
+    min_workers: 2
+```
+
+#### Implementação do adaptive ingestion
+
+```python
+class AdaptiveIngestionController:
+    """Ajusta workers do Glue/EMR baseado no consumer lag do Kafka."""
+
+    def evaluate(self, pipeline_id: str) -> dict:
+        lag = self._get_consumer_lag(pipeline_id)
+        current_workers = self._get_current_workers(pipeline_id)
+        thresholds = self.config.adaptive_thresholds
+
+        if lag > thresholds.high_lag and current_workers < thresholds.max_workers:
+            return {"action": "scale_up", "workers": min(current_workers * 2, thresholds.max_workers)}
+        elif lag < thresholds.low_lag and current_workers > thresholds.min_workers:
+            return {"action": "scale_down", "workers": max(current_workers // 2, thresholds.min_workers)}
+        return {"action": "none", "workers": current_workers}
+
+    def _get_consumer_lag(self, pipeline_id: str) -> int:
+        """Lê consumer lag do CloudWatch (métrica do MSK)."""
+        response = cloudwatch.get_metric_data(
+            MetricDataQueries=[{
+                "Id": "lag",
+                "MetricStat": {
+                    "Metric": {
+                        "Namespace": "AWS/Kafka",
+                        "MetricName": "SumOffsetLag",
+                        "Dimensions": [{"Name": "Consumer Group", "Value": pipeline_id}]
+                    },
+                    "Period": 60, "Stat": "Maximum"
+                }
+            }]
+        )
+        return int(response["MetricDataResults"][0]["Values"][0])
 ```
 
 ---
@@ -575,6 +668,56 @@ source:
 quality:
   - schema_validator
   - freshness_validator    # alerta se stream parar por > 10min
+```
+
+### 4.4 Limites de Escala e Segmentação
+
+> ⚠️ **Risco crítico:** Airflow não escala bem com centenas de DAGs dinâmicas. Sem controle, o scheduler degrada, a UI fica lenta e o parsing vira gargalo.
+
+#### Limites recomendados
+
+| Métrica | Limite Seguro | Limite Máximo | Ação se exceder |
+|---|---|---|---|
+| DAGs por `dag_factory.py` | 100 | 200 | Segmentar por domínio |
+| Tasks por DAG | 30 | 50 | Agrupar tasks |
+| Parse time total | < 500ms | < 1s | Otimizar configs |
+| Scheduler heartbeat | < 5s | < 10s | Aumentar recursos MWAA |
+
+#### Segmentação por domínio
+
+Quando ultrapassar 100 pipelines, segmentar em múltiplos dag_factory:
+
+```python
+# dags/dag_factory_vendas.py
+configs = load_configs_cached(sentinel, domain="vendas")
+
+# dags/dag_factory_financeiro.py
+configs = load_configs_cached(sentinel, domain="financeiro")
+
+# dags/dag_factory_logistica.py
+configs = load_configs_cached(sentinel, domain="logistica")
+```
+
+#### Capacity planning do MWAA
+
+```yaml
+# Configuração MWAA recomendada por faixa
+mwaa_sizing:
+  small:     # < 50 pipelines
+    environment_class: mw1.small
+    min_workers: 1
+    max_workers: 5
+    scheduler_count: 2
+  medium:    # 50-150 pipelines
+    environment_class: mw1.medium
+    min_workers: 2
+    max_workers: 10
+    scheduler_count: 2
+  large:     # 150-300 pipelines
+    environment_class: mw1.large
+    min_workers: 5
+    max_workers: 25
+    scheduler_count: 3  # múltiplos schedulers
 ```
 
 ---
@@ -809,7 +952,153 @@ flowchart LR
 
 ---
 
-## 9. Data Contracts e Qualidade
+## 9. Consistência de Dados no CDC
+
+> ⚠️ **Esta seção aborda o problema mais crítico do CDC:** garantir que os dados no Iceberg refletem fielmente o estado do banco de origem, mesmo com late events, out-of-order e falhas parciais.
+
+### 9.1 Problemas reais do CDC
+
+| Problema | Causa | Consequência sem tratamento |
+|---|---|---|
+| **Late events** | Rede lenta, Debezium lag, retry | Evento antigo sobrescreve dado novo |
+| **Out-of-order** | Kafka não garante ordering global | UPDATE chega antes do INSERT |
+| **Duplicatas** | Kafka at-least-once + restart | Registro duplicado no Iceberg |
+| **Schema drift** | ALTER TABLE no source | Spark falha com coluna inesperada |
+
+### 9.2 Solução: Ordering + Deduplicação + Watermark
+
+```mermaid
+flowchart LR
+    KAFKA["Kafka\neventos brutos"] --> DEDUP["Deduplicação\nROW_NUMBER por PK\nORDER BY ts_ms DESC"]
+    DEDUP --> WMRK["Watermark\nrejeita eventos\n> 10min atrasados"]
+    WMRK --> MERGE["MERGE INTO Iceberg\ncom guarda ts_ms\n> target._cdc_ts_ms"]
+    MERGE --> ICE["Iceberg\nestado consistente"]
+```
+
+**Três camadas de proteção:**
+
+1. **Deduplicação por `ROW_NUMBER`** — para cada PK, mantém apenas o evento mais recente (`ts_ms DESC`)
+2. **Watermark de atraso** — descarta eventos com `ts_ms` muito antigo (configurável por pipeline)
+3. **Guarda no MERGE** — `source.ts_ms > target._cdc_ts_ms` impede que evento antigo sobrescreva dado novo
+
+### 9.3 Coluna `_cdc_ts_ms` no Iceberg
+
+Toda tabela Iceberg gerenciada por CDC inclui colunas de metadados:
+
+```sql
+CREATE TABLE curated.sales.orders (
+    ORDER_ID      BIGINT,
+    STATUS        STRING,
+    AMOUNT        DECIMAL(10,2),
+    UPDATED_AT    TIMESTAMP,
+    -- Metadados CDC (gerenciados automaticamente)
+    _cdc_ts_ms    BIGINT     COMMENT 'Timestamp do último evento CDC aplicado',
+    _cdc_op       STRING     COMMENT 'Última operação CDC: c/u/d/r',
+    _cdc_source   STRING     COMMENT 'Conector de origem'
+) USING iceberg
+PARTITIONED BY (days(UPDATED_AT));
+```
+
+### 9.4 Configuração de watermark no YAML
+
+```yaml
+dag_id: oracle_sales_cdc
+source:
+  type: oracle_cdc
+  connector_name: oracle-sales-conn
+  schema: SALES
+  table: ORDERS
+  primary_keys: [ORDER_ID]
+  # Consistência de dados
+  watermark_delay_minutes: 10        # descarta eventos > 10min atrasados
+  dedup_window_minutes: 30           # janela de deduplicação
+  ordering_column: ts_ms             # campo usado para ordering
+```
+
+### 9.5 Fonte de Verdade por Camada
+
+| Camada | Fonte de Verdade | Justificativa |
+|---|---|---|
+| **Ingestão** | Kafka (tópicos CDC) | Eventos imutáveis, replayável |
+| **Raw/Bronze** | S3 (Iceberg Raw) | JSON/Avro bruto, histórico definitivo |
+| **Curated/Silver** | S3 (Iceberg Curated) | Dados limpos, ACID, versionados |
+| **Hot store** | DynamoDB | Acesso < 1s, TTL, não histórico |
+| **Analytics/Gold** | Athena sobre Iceberg | Visões de negócio, agregadas |
+
+> ❗ **Regra:** Kafka **não é fonte de verdade** para dados históricos. Retention é 7 dias. O Bronze/Iceberg é o registro oficial.
+
+---
+
+## 10. Governança de Ingestão
+
+> ⚠️ **Anti-pattern detectado:** Sem governança, a facilidade do YAML + CDC transforma a plataforma em "CDC indiscriminado" — Kafka cheio, custo alto, caos.
+
+### 10.1 Whitelist de Tabelas CDC
+
+Nem toda tabela deve ser capturada por CDC. Critérios obrigatórios:
+
+```yaml
+# registro/cdc_whitelist.yaml — governado pelo Data Platform Team
+cdc_whitelist:
+  - table: SALES.ORDERS
+    domain: vendas
+    owner: squad-checkout
+    justificativa: "Tabela transacional, 2M+ inserts/dia, deletes precisam ser capturados"
+    custo_estimado_mes: "$45 (MSK Connect + Kafka storage)"
+    valor_negocio: "Dashboard real-time de vendas + feature store ML"
+    aprovado_por: tech-lead-data
+    data_aprovacao: 2026-03-01
+    revisao_proxima: 2026-09-01
+
+  - table: SALES.ITEMS
+    domain: vendas
+    owner: squad-checkout
+    justificativa: "Itens de pedido, join obrigatório com ORDERS"
+    custo_estimado_mes: "$30"
+    valor_negocio: "Complemento de ORDERS para analytics"
+    aprovado_por: tech-lead-data
+    data_aprovacao: 2026-03-01
+    revisao_proxima: 2026-09-01
+```
+
+### 10.2 Scoring de Custo vs Valor
+
+Antes de adicionar uma tabela ao CDC, avaliar:
+
+| Critério | Peso | Pontuação (1-5) |
+|---|---|---|
+| Frequência de mudanças | 25% | 5 = > 100k/dia, 1 = < 100/dia |
+| Necessidade de latência < 5min | 25% | 5 = crítico, 1 = batch diário ok |
+| Captura de DELETEs necessária | 20% | 5 = obrigatório, 1 = não |
+| Número de consumers | 15% | 5 = 5+, 1 = 1 |
+| Impacto de query JDBC no banco | 15% | 5 = alto, 1 = irrelevante |
+
+**Regra:** Score > 3.5 → CDC recomendado. Score < 2.5 → JDBC suficiente.
+
+### 10.3 Processo de aprovação
+
+```mermaid
+flowchart LR
+    DEV["Dev solicita\nnova tabela CDC"] --> SCORE["Scoring\ncusto vs valor"]
+    SCORE --> DEC{"Score > 3.5?"}
+    DEC -- sim --> REVIEW["Review\nData Platform Team"]
+    DEC -- não --> JDBC["Redireciona\npara JDBC"]
+    REVIEW --> WHITELIST["Adiciona\nà whitelist"]
+    WHITELIST --> DEPLOY["Deploy\nconector + YAML"]
+```
+
+### 10.4 Revisão semestral
+
+Toda tabela CDC é revisada semestralmente:
+
+- [ ] Consumer lag estável? (se não, redimensionar)
+- [ ] Custo justificado pelo valor? (se não, migrar para JDBC)
+- [ ] Tabela ainda existe/é relevante? (se não, remover conector)
+- [ ] Schema evoluiu de forma compatível? (se não, planejar migração)
+
+---
+
+## 11. Data Contracts e Qualidade
 
 ### Schema Registry integrado ao CDC
 
@@ -870,9 +1159,42 @@ LIMIT 50;
 
 > 📘 **Complemento conceitual:** Para exemplos detalhados de Data Contracts com versionamento SemVer, evolução de schema e governança Data Mesh, consulte o [README.md — Governança Operacional](./README.md#4️⃣-governança-operacional-data-mesh-real).
 
+### Enforcement de Schema Evolution no Runtime
+
+Breaking changes são detectadas automaticamente e bloqueiam o pipeline:
+
+```python
+class SchemaEvolutionEnforcer:
+    """Bloqueia pipeline se schema change for breaking."""
+
+    BREAKING_CHANGES = [
+        "COLUMN_REMOVED",
+        "TYPE_CHANGED",
+        "NULLABLE_TO_REQUIRED",
+    ]
+
+    def check(self, current_schema: dict, new_schema: dict) -> ValidationResult:
+        diff = self._compute_diff(current_schema, new_schema)
+
+        breaking = [d for d in diff if d.change_type in self.BREAKING_CHANGES]
+        if breaking:
+            return ValidationResult(
+                status="BLOCKED",
+                error=f"Breaking schema change detectada: {breaking}",
+                recommendation=(
+                    "1. Comunicar consumers afetados\n"
+                    "2. Publicar nova versão do Data Contract\n"
+                    "3. Migrar consumers antes de aplicar mudança"
+                ),
+                alert_sns=True  # notifica automaticamente
+            )
+
+        return ValidationResult(status="PASS", changes=diff)
+```
+
 ---
 
-## 10. Observabilidade
+## 12. Observabilidade
 
 ### Alertas automáticos gerados pelo YAML
 
@@ -923,9 +1245,179 @@ monitoring:
 
 > 📘 **Complemento conceitual:** Para as 4 dimensões de observabilidade (Latência, Volume, Qualidade, Custo), SLOs com alertas e exemplos PromQL, consulte o [README.md — Observabilidade](./README.md#5️⃣-observabilidade-end-to-end).
 
+### Dashboard de Correlação End-to-End
+
+> ⚠️ **Problema identificado:** Kafka lag alto, Spark lento e Iceberg commit demorado são sintomas **conectados**, mas frequentemente monitorados de forma isolada.
+
+#### Correlação automática por pipeline
+
+```python
+def build_correlation_dashboard(pipeline_id: str) -> dict:
+    """Gera visão unificada de métricas correlacionadas."""
+    return {
+        "pipeline": pipeline_id,
+        "kafka": {
+            "consumer_lag": get_metric("AWS/Kafka", "SumOffsetLag", pipeline_id),
+            "throughput_in": get_metric("AWS/Kafka", "BytesInPerSec", pipeline_id),
+            "partition_count": get_topic_partitions(pipeline_id),
+        },
+        "spark": {
+            "batch_duration_ms": get_metric("Spark", "batch.duration", pipeline_id),
+            "records_per_batch": get_metric("Spark", "batch.records", pipeline_id),
+            "active_executors": get_metric("EMR", "active.executors", pipeline_id),
+        },
+        "iceberg": {
+            "commit_duration_ms": get_metric("Iceberg", "commit.duration", pipeline_id),
+            "files_per_commit": get_metric("Iceberg", "commit.files", pipeline_id),
+            "compaction_pending": get_metric("Iceberg", "compaction.pending", pipeline_id),
+        },
+        # Correlação: se lag sobe E batch duration sobe, problema é throughput
+        # Se lag sobe MAS batch duration estável, problema é particionamento
+        "diagnosis": diagnose_bottleneck(pipeline_id),
+    }
+
+def diagnose_bottleneck(pipeline_id: str) -> str:
+    lag = get_metric("AWS/Kafka", "SumOffsetLag", pipeline_id)
+    batch_ms = get_metric("Spark", "batch.duration", pipeline_id)
+    commit_ms = get_metric("Iceberg", "commit.duration", pipeline_id)
+
+    if lag > 50000 and batch_ms > 60000:
+        return "BOTTLENECK_SPARK: aumentar workers ou maxOffsetsPerTrigger"
+    if lag > 50000 and batch_ms < 30000:
+        return "BOTTLENECK_KAFKA: aumentar partições ou tasks.max"
+    if commit_ms > 30000:
+        return "BOTTLENECK_ICEBERG: executar compaction, verificar small files"
+    return "HEALTHY"
+```
+
+#### Regra de alerta correlacionado
+
+```yaml
+monitoring:
+  correlation_alerts:
+    - name: "CDC pipeline degraded"
+      condition: |
+        kafka.consumer_lag > 50000
+        AND spark.batch_duration_ms > 60000
+        AND duration > 3 consecutive checks
+      severity: CRITICAL
+      action: page_oncall
+      runbook: runbooks/cdc_pipeline_degraded.md
+```
+
 ---
 
-## 11. Decisões Arquiteturais
+## 13. Modelo Operacional — SRE e Incident Response
+
+> ⚠️ **Gap crítico identificado:** A plataforma tem alta entropia operacional (Kafka, Debezium, EMR, Airflow, DynamoDB, SQS). Sem modelo operacional claro, quem opera isso 24/7?
+
+### 13.1 Estrutura de Oncall
+
+| Camada | Responsável | Escopo | Horário |
+|---|---|---|---|
+| **L1 — Monitoração** | SRE / DevOps | Alertas automáticos, restart de conectores | 24/7 (automação) |
+| **L2 — Triagem** | Data Engineer oncall | Pipeline failures, consumer lag, quality gate | Horário comercial + plantão |
+| **L3 — Escalação** | Tech Lead / Arquiteto | Falhas sistêmicas, data loss, schema break | Sob demanda |
+
+### 13.2 Runbooks Obrigatórios
+
+Cada componente crítico deve ter runbook versionado no Git:
+
+```
+runbooks/
+  debezium_connector_failed.md       # Conector Debezium parou
+  kafka_consumer_lag_high.md         # Consumer lag > threshold
+  spark_job_oom.md                   # EMR/Glue OOM
+  iceberg_commit_failed.md           # Commit ACID falhou
+  quality_gate_failed.md             # Validação de qualidade falhou
+  dag_factory_parse_slow.md          # Parse > 1s
+  dlq_messages_accumulating.md       # DLQ com mensagens não processadas
+  schema_drift_detected.md           # Schema change no source
+```
+
+#### Exemplo de runbook: Debezium Connector Failed
+
+```markdown
+# Debezium Connector Failed
+
+## Sintoma
+Alerta: `debezium.connector_status = FAILED`
+
+## Diagnóstico
+1. Verificar status: `aws kafkaconnect describe-connector --connector-arn <ARN>`
+2. Verificar logs: CloudWatch > /aws/msk-connect/<connector-name>
+3. Causas comuns:
+   - Credenciais expiradas (rotacionar no Secrets Manager)
+   - Supplemental logging desabilitado (DBA desligou)
+   - Slot de replicação cheio (PostgreSQL)
+   - Rede: security group bloqueando porta do DB
+
+## Resolução
+1. Se credencial: rotacionar e restart conector
+2. Se log desabilitado: contatar DBA, habilitar, restart
+3. Se slot cheio: `SELECT pg_drop_replication_slot('slot_name')` e recriar
+4. Restart: `aws kafkaconnect update-connector --current-version <V> ...`
+
+## Escalação
+Se não resolver em 30min → escalar para L3
+
+## Impacto
+- Dados param de fluir para Kafka
+- Consumer lag não cresce (não há novos eventos)
+- Iceberg fica desatualizado
+```
+
+### 13.3 Incident Response
+
+```mermaid
+flowchart TD
+    ALERT["Alerta disparado"] --> TRIAGE{"Severidade?"}
+    TRIAGE -- P1 Critical --> ONCALL["Page oncall L2\n< 5min resposta"]
+    TRIAGE -- P2 Warning --> SLACK["Notificação Slack\n< 30min resposta"]
+    TRIAGE -- P3 Info --> TICKET["Ticket JIRA\npróximo sprint"]
+
+    ONCALL --> DIAG["Diagnóstico\nseguir runbook"]
+    DIAG --> RESOLVE{"Resolvido?"}
+    RESOLVE -- sim --> POSTMORTEM["Postmortem\nobrigatório para P1"]
+    RESOLVE -- não --> ESCALATE["Escalar L3\n< 1h"]
+```
+
+| Severidade | Critério | SLA Resposta | SLA Resolução |
+|---|---|---|---|
+| **P1 — Critical** | Data loss, pipeline crítico parado | < 5 min | < 1 hora |
+| **P2 — Warning** | Degradação, lag alto, quality fail | < 30 min | < 4 horas |
+| **P3 — Info** | Métrica fora do normal, não urgente | < 4 horas | Próximo sprint |
+
+### 13.4 Postmortem Template
+
+```markdown
+# Postmortem: [Título do Incidente]
+**Data:** YYYY-MM-DD
+**Severidade:** P1/P2
+**Duração:** X horas
+**Impacto:** [descrição do impacto em dados/negócio]
+
+## Timeline
+- HH:MM — Alerta disparado
+- HH:MM — Oncall acionado
+- HH:MM — Causa raiz identificada
+- HH:MM — Fix aplicado
+- HH:MM — Dados reconciliados
+
+## Causa Raiz
+[análise detalhada]
+
+## Action Items
+- [ ] [Ação 1] — Responsável — Prazo
+- [ ] [Ação 2] — Responsável — Prazo
+
+## Lições Aprendidas
+[o que mudar para evitar recorrência]
+```
+
+---
+
+## 14. Decisões Arquiteturais
 
 ### JDBC vs CDC — por pipeline, não por arquitetura
 
@@ -967,9 +1459,22 @@ Para a camada CDC, MSK Kafka é a escolha correta (Debezium tem suporte nativo).
 | Controle do job Spark | limitado (Glue UI) | total |
 | Recomendação | near real-time simples | CDC com lógica complexa de MERGE |
 
+### Padronização de Compute — Decisão Arquitetural
+
+> ❗ **Decisão:** **EMR Serverless com Spark Structured Streaming** é o padrão da plataforma para CDC. Glue Streaming é exceção controlada.
+
+| Critério | Padrão (EMR Serverless) | Exceção (Glue Streaming) |
+|---|---|---|
+| **Usar quando** | CDC com MERGE complexo, batch, consolidação | Near real-time trivial, sem lógica de MERGE |
+| **Controle Spark** | Total (versão, config, JARs) | Limitado |
+| **Custo** | Pay-per-use (vCPU/hora) | DPU/hora fixo |
+| **Justificativa para exceção** | N/A | Requer aprovação do Tech Lead |
+
+Esta padronização evita o problema de manter dois paradigmas de streaming diferentes, reduzindo complexidade operacional.
+
 ---
 
-## 12. Experiência do Desenvolvedor
+## 15. Experiência do Desenvolvedor
 
 ### Novo pipeline CDC — do zero ao produção
 
@@ -1015,7 +1520,7 @@ sequenceDiagram
 
 ---
 
-## 13. Próximos Passos
+## 16. Próximos Passos
 
 | Item | Responsável | Sprint | Prioridade |
 |---|---|---|---|
