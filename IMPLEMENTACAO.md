@@ -536,6 +536,15 @@ class AdaptiveIngestionController:
         return int(response["MetricDataResults"][0]["Values"][0])
 ```
 
+> ⚠️ **Limitações do controle adaptativo:** O modelo acima é simplificado intencionalmente. Em produção, backpressure deve considerar não apenas consumer lag, mas também:
+>
+> - **Skew de chave** — uma partição Kafka pode ter 10x mais eventos que outra, causando straggler no Spark
+> - **Tempo de commit no Iceberg** — muitos small files degradam performance de commit e leitura; compaction deve ser monitorada
+> - **Custo incremental de scale-up** — duplicar workers não duplica throughput se o bottleneck for I/O ou rede
+> - **Micro-batch processing time** — se o batch demora mais que a janela configurada, o lag cresce mesmo com workers suficientes
+>
+> O `AdaptiveIngestionController` é o ponto de partida; a calibração final depende de observação em produção com carga real.
+
 ---
 
 ## 4. DAG Factory — geração dinâmica
@@ -1027,6 +1036,47 @@ source:
 
 > ❗ **Regra:** Kafka **não é fonte de verdade** para dados históricos. Retention é 7 dias. O Bronze/Iceberg é o registro oficial.
 
+### 9.6 Reconciliação: Hot Store vs Curated
+
+DynamoDB (hot store) é **derivado operacional** e pode divergir temporariamente do Iceberg Curated. A reconciliação oficial é **sempre contra Iceberg Curated**.
+
+```mermaid
+flowchart LR
+    CDC["Evento CDC"] --> LAMBDA["Lambda\natualiza DynamoDB\n< 1s"]
+    CDC --> SPARK["Spark SS\nMERGE INTO Iceberg\n1-5min"]
+    LAMBDA --> DDB["DynamoDB\nhot store · eventual"]
+    SPARK --> ICE["Iceberg Curated\nfonte oficial"]
+    ICE -->|reconciliação diária| DDB
+```
+
+**Comportamento esperado:**
+
+| Situação | DynamoDB | Iceberg | Ação |
+|---|---|---|---|
+| Operação normal | Atualizado < 1s | Atualizado < 5min | Nenhuma |
+| Lambda falha | **Desatualizado** | Atualizado | Reconciliação automática via batch |
+| Spark falha | Atualizado | **Desatualizado** | DLQ + retry; DynamoDB serve como cache |
+| Divergência detectada | Valor X | Valor Y | **Iceberg prevalece** — DynamoDB é sobrescrito |
+
+**Reconciliação automática (diária):**
+
+```python
+def reconcile_hot_store(table: str):
+    """Reconcilia DynamoDB contra Iceberg Curated.
+    Iceberg é SEMPRE a fonte oficial."""
+    iceberg_data = spark.read.table(f"curated.{table}")
+    dynamo_data = read_dynamodb_table(table)
+
+    divergences = iceberg_data.join(
+        dynamo_data, on="pk", how="full_outer"
+    ).filter("iceberg_value != dynamo_value OR dynamo_value IS NULL")
+
+    if divergences.count() > 0:
+        # Sobrescreve DynamoDB com dados do Iceberg
+        write_to_dynamodb(divergences.select(iceberg_columns))
+        alert(f"Reconciliação: {divergences.count()} registros corrigidos em {table}")
+```
+
 ---
 
 ## 10. Governança de Ingestão
@@ -1192,6 +1242,42 @@ class SchemaEvolutionEnforcer:
         return ValidationResult(status="PASS", changes=diff)
 ```
 
+#### Matriz de Ação por Tipo de Schema Change
+
+| Tipo de Mudança | Classificação | Ação Automática | Exemplo |
+|---|---|---|---|
+| Campo opcional adicionado | **Non-breaking** | ✅ Pipeline segue normalmente | Adicionar `cupom: string?` |
+| Default value alterado | **Non-breaking** | ✅ Pipeline segue + log info | Alterar default de 0 para -1 |
+| Campo obrigatório adicionado | **Breaking controlado** | ⚠️ Roteamento para quarentena + alerta P2 | Adicionar `region: string` sem default |
+| Tipo de campo alterado | **Breaking controlado** | ⚠️ Quarentena + alerta P2 + bloqueia novos batches | Alterar `amount: int` → `amount: string` |
+| Campo removido | **Breaking crítico** | 🛑 Pipeline bloqueado + alerta P1 + page oncall | Remover coluna `status` |
+| Tabela renomeada | **Breaking crítico** | 🛑 Pipeline bloqueado + alerta P1 | Renomear `orders` → `pedidos` |
+
+```python
+# Ações concretas por classificação
+SCHEMA_CHANGE_ACTIONS = {
+    "NON_BREAKING": {
+        "pipeline": "CONTINUE",
+        "alert": None,
+        "log": "INFO",
+    },
+    "BREAKING_CONTROLLED": {
+        "pipeline": "QUARANTINE",   # eventos vão para s3://quarantine/{pipeline}/
+        "alert": "P2_WARNING",
+        "log": "WARNING",
+        "auto_action": "Notifica owner do Data Contract por Slack",
+        "fallback": "Eventos em quarentena são reprocessados após fix",
+    },
+    "BREAKING_CRITICAL": {
+        "pipeline": "BLOCK",        # pipeline para completamente
+        "alert": "P1_CRITICAL",     # page oncall imediato
+        "log": "ERROR",
+        "auto_action": "Abre incident automático no PagerDuty/Slack",
+        "fallback": "Requer intervenção manual + postmortem",
+    },
+}
+```
+
 ---
 
 ## 12. Observabilidade
@@ -1248,6 +1334,31 @@ monitoring:
 ### Dashboard de Correlação End-to-End
 
 > ⚠️ **Problema identificado:** Kafka lag alto, Spark lento e Iceberg commit demorado são sintomas **conectados**, mas frequentemente monitorados de forma isolada.
+
+### Rastreabilidade End-to-End: Correlation ID
+
+Todo evento CDC carrega um `correlation_id` que permite rastrear desde o Kafka até o commit Iceberg:
+
+```python
+# Gerado pelo DebeziumCdcAdapter no início do micro-batch
+correlation_id = f"{pipeline_id}:{batch_id}:{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}"
+
+# Propagado em cada etapa:
+# 1. Kafka consumer   → log: {"correlation_id": "...", "offsets": "100-200", "records": 5000}
+# 2. Spark micro-batch → log: {"correlation_id": "...", "duration_ms": 12000, "rows": 4800}
+# 3. Iceberg commit   → log: {"correlation_id": "...", "commit_id": "snap-123", "files": 3}
+# 4. Quality gate     → log: {"correlation_id": "...", "status": "PASS", "checks": 4}
+# 5. Alerta (se houver) → {"correlation_id": "...", "severity": "P2"}
+```
+
+**Benefício:** Um único `correlation_id` permite reconstruir o caminho completo de um batch — do offset Kafka ao commit Iceberg — em segundos via CloudWatch Insights:
+
+```sql
+-- CloudWatch Insights: rastrear batch completo
+fields @timestamp, @message
+| filter correlation_id = "oracle_sales_cdc:batch_42:20260324T083000"
+| sort @timestamp asc
+```
 
 #### Correlação automática por pipeline
 

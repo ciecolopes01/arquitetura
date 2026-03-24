@@ -179,6 +179,8 @@ spec:
 
 **Regra de ouro:** Se migrar de cloud custa > 6 meses, você tem lock-in.
 
+> ❗ **Lock-in consciente vs inconsciente:** Esta arquitetura usa serviços gerenciados AWS (MWAA, MSK, EMR Serverless, Glue, DynamoDB) como **escolha deliberada** para velocidade operacional. Isso é **lock-in consciente e negociado**: os formatos de dados (Iceberg, Parquet, Avro), contratos (Avro schemas) e lógica de negócio (Spark SQL padrão) permanecem **portáveis**. A migração de cloud exigiria trocar orquestração e infra, mas **não reescrever pipelines ou contratos**. Essa distinção é fundamental.
+
 ---
 
 ## ❌ 5. Metrics Vanity
@@ -810,6 +812,8 @@ Mas também **significativamente mais complexa e cara**.
 
 ### Exemplo de ROI: Feature Store
 
+> ⚠️ **Nota importante:** Todos os números de custo, latência e ROI neste documento são **cenários exemplificativos de referência**, não benchmarks universais. Os valores reais variam significativamente com: tamanho do time, maturidade organizacional, volume de dados, região AWS, negociação comercial e complexidade dos pipelines. Use como ponto de partida para estimar seu caso específico.
+
 **Situação sem Feature Store:**
 
 * Cientista de dados reescreve feature para produção: **40h por modelo**
@@ -1390,6 +1394,38 @@ Se sua arquitetura só funciona no PowerPoint, ela não é moderna.
 | **Breaking Change**| Mudança incompatível com versão anterior     | Remover campo obrigatório                  |
 | **Backfill**     | Reprocessamento histórico de dados             | Recalcular features dos últimos 2 anos     |
 | **Compaction**   | Consolidação de arquivos pequenos              | Merge de 1000 arquivos em 10 otimizados    |
+
+---
+
+---
+
+# FAQ — Perguntas Frequentes (Defesa Técnica)
+
+Respostas preparadas para questionamentos comuns em revisão arquitetural.
+
+### "Por que tanta complexidade? Não é over-engineering?"
+
+A arquitetura é **modular e orientada a capacidade**. Cada componente resolve um problema específico: CDC (captura de mudanças), Kafka (replay e desacoplamento), EMR (processamento pesado), DynamoDB (baixa latência). Em cenários menores, é possível — e recomendado — usar apenas um subconjunto. Um time com 3 pipelines batch não precisa de Kafka. A arquitetura suporta adoção incremental por nível de maturidade (veja [Evolução por Maturidade](#9️⃣-evolução-por-maturidade)).
+
+### "Por que misturar streaming e batch?"
+
+Porque os requisitos são diferentes e coexistem. Batch é custo-eficiente para consolidação histórica e SCD Type 2. Streaming é necessário quando latência < 5min é requisito de negócio. A arquitetura suporta ambos **sem duplicar lógica**: o mesmo `SourceAdapter` gera argumentos Spark tanto para batch (EMR) quanto para streaming (Spark SS), e o `PipelineOrchestratorEngine` é agnóstico ao modo.
+
+### "Exactly-once é real nessa arquitetura?"
+
+Exactly-once **não é garantia mágica do framework**. É garantido pela **combinação** de três mecanismos: (1) idempotência no sink via `MERGE INTO` Iceberg com deduplicação por PK + `ts_ms`, (2) checkpoint consistente do Spark Structured Streaming, e (3) overwrite atômico de partições com marker `_SUCCESS`. Nenhum componente isolado garante exactly-once; é a composição que garante.
+
+### "E se o Kafka cair?"
+
+Três camadas de fallback: (1) **Replay**: o Kafka tem retenção de 7 dias — após recovery, o consumer retoma do último offset commitado. (2) **DLQ + retry**: falhas de processamento vão para SQS DLQ com retry automático via DAG de reexecução. (3) **Fallback JDBC**: para tabelas críticas, é possível manter um pipeline JDBC em standby que ativa automaticamente se o CDC ficar indisponível por > 30min, usando a mesma interface `SourceAdapter`.
+
+### "Qual o limite de escala do Airflow?"
+
+Os limites estão documentados na seção [Limites de Escala](./IMPLEMENTACAO.md#44-limites-de-escala-e-segmentação): máximo recomendado de 100 DAGs por `dag_factory.py`, com segmentação por domínio acima disso. Para cenários de 500+ pipelines, a evolução natural é migrar a orquestração para Apache Airflow 2.x com múltiplos schedulers ou avaliar alternativas como Dagster/Prefect como orquestrador, mantendo os Adapters e Engines intactos.
+
+### "Quanto custa operar isso?"
+
+O custo operacional cresce com maturidade, não linearmente com volume. A arquitetura **só faz sentido quando há ROI claro**: ML em produção, múltiplos domínios, compliance, ou escala que justifique a plataforma. Para um time com 5 pipelines batch, um Airflow + EMR simples é suficiente. Os números de custo neste documento são [cenários exemplificativos](#exemplo-de-roi-feature-store), não benchmarks universais.
 
 ---
 
